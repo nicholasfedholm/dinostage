@@ -94,6 +94,7 @@ public sealed class ExtTest
         logPath = Path.Combine(api.GetOrCreateDataPath("dinostage"), "ext-" + ts + ".txt");
         L("DinoStage ext test " + ts + ". Mover guard: " + MoverGuard.Status);
         Ops.TestAlwaysActive = true;
+        Ops.TestRequirePoses = true; // server animator computes RootPoses for the 1.1.0 phase A pose checks
         try
         {
             mover = new ItemEntityMoverTool();
@@ -119,6 +120,7 @@ public sealed class ExtTest
         BuildTwoActor();
         BuildUnstage();
         BuildScene();
+        BuildAnim();
         steps.Enqueue(() => { Finish(); return true; });
         listener = api.Event.RegisterGameTickListener(Tick, 50);
         return logPath;
@@ -519,6 +521,181 @@ public sealed class ExtTest
             try { SceneIO.Delete(api, scene); } catch { }
         });
         Do(() => { try { Ops.ThawEntity(sys, Bear!); Ops.ThawEntity(sys, T!); Ops.Despawn(Bear!); Ops.Despawn(T!); } catch { } });
+        Delay(10);
+    }
+
+    // ------------------------------------------------------------------ phase A: 1.1.0 anim API on the real LoP theropod
+
+    void BuildAnim()
+    {
+        const string scene = "ext-anim-layers";
+        Entity? X = null;
+        string kb = "", kl = "", kn = "", dk = "";
+        Dictionary<string, float[]>? pBase = null, pDef = null, pRef = null;
+        bool ok = false;
+        const float Eps = 1e-4f;
+        string? pyc = null;
+        Do(() =>
+        {
+            Info("=== phase A (1.1.0): freeze default capture, layers, resetpose, scene with layers on the LoP theropod ===");
+            pyc = api.World.EntityTypes.FirstOrDefault(t => t.Code.Path.Contains("pycnonemosaurus") && t.Code.Path.Contains("adult-male"))?.Code.ToString();
+            string code = pyc ?? codeT;
+            Info("actor: " + code + (pyc != null ? " (Pycnonemosaurus adult male)" : " (fallback theropod; no Pycnonemosaurus adult male installed)"));
+            X = SpawnAt(code, bx, gy + 4, bz);
+        });
+        Delay(10);
+        Do(() =>
+        {
+            Entity e = X!;
+            dk = Freeze.DefaultAnimKey(e) ?? "";
+            Info("default animation key of the actor: " + (dk.Length > 0 ? dk : "none"));
+            StageData d = Ops.FreezeEntity(sys, e); // no explicit anim, like /stage freeze with no anim
+            Info("freeze no anim: anim='" + d.Anim + "' source='" + d.Source + "' speed=" + Ops.F(d.Speed) + " frame=" + Ops.F(d.Frame));
+            if (dk.Length > 0)
+            {
+                ChkBool("A freeze default: held anim is the default animation", string.Equals(d.Anim, dk, StringComparison.OrdinalIgnoreCase), true);
+                ChkBool("A freeze default: source 'default'", d.Source == "default", true);
+                Chk("A freeze default: speed 0", d.Speed, 0, 1e-6);
+                Chk("A freeze default: frame 0", d.Frame, 0, 1e-6);
+            }
+            else ChkBool("A freeze default: no default animation, falls back to captured/empty", d.Source == "captured" || d.Anim.Length == 0, true);
+            kb = d.Anim;
+            var keys = AnimProbe.ShapeKeys(e, 5);
+            ok = kb.Length > 0 && keys.Count >= 3;
+            if (ok)
+            {
+                foreach (string k in keys) if (k != kb && AnimProbe.KeyedElements(e, k).Count > 0) { kl = k; break; }
+                foreach (string k in keys) if (k != kb && k != kl) { kn = k; break; }
+                ok = kl.Length > 0 && kn.Length > 0;
+            }
+            Info("base=" + kb + " layer=" + kl + " other=" + kn + " ok=" + ok);
+        });
+        Delay(8);
+        Do(() =>
+        {
+            if (!ok) return;
+            Entity e = X!;
+            var run = AnimProbe.RunningKeys(e);
+            ChkBool("A freeze default: only the held base runs (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { kb }), true);
+            pDef = AnimProbe.Poses(e);
+            ChkBool("A poses available", pDef != null && pDef.Count > 0, true);
+            // reference: explicit freeze on the same anim at frame 0 must give the same pose
+            Ops.ThawEntity(sys, e);
+        });
+        Delay(6);
+        Do(() => { if (ok) Ops.FreezeEntity(sys, X!, kb, 0f, 0f); });
+        Delay(8);
+        Do(() =>
+        {
+            if (!ok) return;
+            pRef = AnimProbe.Poses(X!);
+            if (pDef != null && pRef != null) Chk("A default capture pose == explicit freeze of the same anim at frame 0", AnimProbe.MaxDiff(pDef, pRef), 0.0, Eps);
+            pBase = pRef;
+            // layer on top
+            Entity e = X!;
+            StageData d = StageState.Read(e)!;
+            string msg = AnimOps.AddLayer(e, d, kl, 0, "0.5");
+            Info("AddLayer: " + msg);
+            Ops.Commit(sys, e, d);
+        });
+        Delay(8);
+        Do(() =>
+        {
+            if (!ok) return;
+            Entity e = X!;
+            var run = AnimProbe.RunningKeys(e);
+            ChkBool("A layer: running keys == [base,layer] (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { kb, kl }), true);
+            var p = AnimProbe.Poses(e);
+            if (p != null && pBase != null)
+            {
+                HashSet<string> diff = AnimProbe.Differing(p, pBase, Eps), keyed = AnimProbe.KeyedElements(e, kl);
+                HashSet<string> outside = new(diff, StringComparer.OrdinalIgnoreCase); outside.ExceptWith(keyed);
+                Info("A layer diff elements=" + diff.Count + " keyed by layer=" + keyed.Count + " outside=" + AnimProbe.J(outside));
+                ChkBool("A layer: pose differs from base alone", diff.Count > 0, true);
+                ChkBool("A layer: pose differs only on the layer's keyframed elements", outside.Count == 0, true);
+            }
+            // clean switch drops the layer
+            StageData d = StageState.Read(e)!;
+            AnimOps.SetBase(e, d, kn, 0, "0.5");
+            Ops.Commit(sys, e, d);
+        });
+        Delay(8);
+        Do(() =>
+        {
+            if (!ok) return;
+            Entity e = X!;
+            var run = AnimProbe.RunningKeys(e);
+            ChkBool("A clean switch from base+layer: running keys == [other] (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { kn }), true);
+            ChkBool("A clean switch cleared the layer", StageState.Read(e)!.Layers.Count == 0, true);
+            // build base + layer again for the scene
+            StageData d = StageState.Read(e)!;
+            AnimOps.SetBase(e, d, kb, 0, "0.3");
+            AnimOps.AddLayer(e, d, kl, 0, "0.6");
+            d.Pitch = 7f * Ops.Deg; d.Roll = -5f * Ops.Deg; d.Yaw = 200f * Ops.Deg;
+            Ops.Commit(sys, e, d);
+        });
+        Delay(8);
+        float ib = 0, il = 0; Vec3d pos0 = new();
+        Do(() =>
+        {
+            if (!ok) return;
+            Entity e = X!;
+            StageData d = StageState.Read(e)!;
+            ib = d.Frame; il = d.Layers[0].Frame; pos0 = e.Pos.XYZ.Clone();
+            pBase = AnimProbe.Poses(e);
+            string path = SceneIO.Save(api, scene, new[] { e }, e.Pos.XYZ);
+            Info("scene saved with 1 layer: " + path);
+            Ops.ThawEntity(sys, e);
+            Ops.Despawn(e);
+        });
+        Delay(20);
+        Do(() =>
+        {
+            if (!ok) return;
+            var loaded = new List<Entity>(); var rep = new StringBuilder();
+            bool l = SceneIO.Load(sys, scene, loaded, rep);
+            foreach (string line in rep.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries)) Info("load: " + line.TrimEnd());
+            ChkBool("A scene with layers loads (respawn or nearest)", l && loaded.Count == 1, true);
+            if (loaded.Count == 1) X = loaded[0]; else abort = true;
+        });
+        Delay(10);
+        Do(() =>
+        {
+            if (!ok) return;
+            Entity e = X!;
+            StageData? d = StageState.Read(e);
+            ChkBool("A scene: staged with base + 1 layer", d != null && d.Staged && d.Anim == kb && d.Layers.Count == 1 && d.Layers[0].Anim == kl, true);
+            if (d != null && d.Layers.Count == 1)
+            {
+                Chk("A scene: base frame", d.Frame, ib, 1e-4);
+                Chk("A scene: layer frame", d.Layers[0].Frame, il, 1e-4);
+                Chk("A scene: yaw", d.Yaw, 200f * Ops.Deg, 1e-4);
+            }
+            var run = AnimProbe.RunningKeys(e);
+            ChkBool("A scene: running keys == [base,layer] (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { kb, kl }), true);
+            var p = AnimProbe.Poses(e);
+            if (p != null && pBase != null) Chk("A scene: reloaded stacked pose identical to the saved one", AnimProbe.MaxDiff(p, pBase), 0.0, Eps);
+            // resetpose
+            StageData d2 = StageState.Read(e)!;
+            AnimOps.ResetPose(d2);
+            Ops.Commit(sys, e, d2);
+        });
+        Delay(8);
+        Do(() =>
+        {
+            if (!ok) return;
+            Entity e = X!;
+            var run = AnimProbe.RunningKeys(e);
+            ChkBool("A resetpose: nothing runs (found " + AnimProbe.J(run) + ")", run.Count == 0, true);
+            var p = AnimProbe.Poses(e);
+            if (p != null) { var ni = AnimProbe.NonIdentity(p, Eps); ChkBool("A resetpose: bind pose (non-identity elements: " + AnimProbe.J(ni) + ")", ni.Count == 0, true); }
+            StageData d = StageState.Read(e)!;
+            Chk("A resetpose: yaw untouched", d.Yaw, 200f * Ops.Deg, 1e-4);
+            Chk("A resetpose: pitch untouched", d.Pitch, 7f * Ops.Deg, 1e-4);
+            try { SceneIO.Delete(api, scene); } catch { }
+            Ops.ThawEntity(sys, e);
+            Ops.Despawn(e);
+        });
         Delay(10);
     }
 }

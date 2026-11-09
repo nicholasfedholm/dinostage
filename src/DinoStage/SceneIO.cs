@@ -26,6 +26,16 @@ public sealed class SceneActor
     public float Frame { get; set; }
     public bool Staged { get; set; }
     public bool NoPhys { get; set; } = true;
+    /// <summary>1.1.0, optional: stacked animations. Absent in a 1.0.0 scene (loads as none) and omitted when there are none.</summary>
+    [System.Text.Json.Serialization.JsonIgnore(Condition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull)]
+    public List<SceneLayer>? Layers { get; set; }
+}
+
+public sealed class SceneLayer
+{
+    public string Anim { get; set; } = "";
+    public float Speed { get; set; }
+    public float Frame { get; set; }
 }
 
 public sealed class SceneData
@@ -117,6 +127,7 @@ public static class SceneIO
                 Heading = st ? d!.Yaw : e.Pos.Yaw, Pitch = st ? d!.Pitch : e.Pos.Pitch, Roll = st ? d!.Roll : e.Pos.Roll,
                 Anim = st ? d!.Anim : "", Speed = st ? d!.Speed : 0f, Frame = st ? d!.Frame : 0f,
                 Staged = st, NoPhys = st ? d!.NoPhys : true,
+                Layers = st && d!.Layers.Count > 0 ? d.Layers.Select(l => new SceneLayer { Anim = l.Anim, Speed = l.Speed, Frame = l.Frame }).ToList() : null,
             });
         }
         string path = PathFor(api, name);
@@ -175,6 +186,9 @@ public static class SceneIO
             if (a.Staged)
             {
                 var d = new StageData { Staged = true, Anim = a.Anim, Speed = a.Speed, Frame = a.Frame, Yaw = a.Heading, Pitch = a.Pitch, Roll = a.Roll, NoPhys = a.NoPhys };
+                if (a.Layers != null)
+                    foreach (SceneLayer l in a.Layers.Take(AnimSet.MaxLayers))
+                        if (!string.IsNullOrEmpty(l.Anim)) d.Layers.Add(new LayerData { Anim = l.Anim.ToLowerInvariant(), Speed = l.Speed, Frame = l.Frame });
                 Ops.Commit(sys, e, d);
             }
             else if (StageState.IsStaged(e)) Ops.ThawEntity(sys, e);

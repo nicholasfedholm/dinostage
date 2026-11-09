@@ -11,6 +11,7 @@ public sealed class DinoStageSystem : ModSystem
 {
     public ICoreServerAPI? Sapi;
     ICoreClientAPI? capi;
+    ClientShot? shot;
     Harmony? harmony;
     long tickId;
     int errCount;
@@ -22,6 +23,7 @@ public sealed class DinoStageSystem : ModSystem
     public override void StartServerSide(ICoreServerAPI api)
     {
         Sapi = api;
+        api.Network.RegisterChannel(ClientShot.Channel).RegisterMessageType<ShotMsg>();
         harmony = new Harmony("dinostage");
         MoverGuard.Apply(harmony, api);
 
@@ -73,6 +75,7 @@ public sealed class DinoStageSystem : ModSystem
     {
         capi = api;
         ClientHold.Start(api);
+        shot = new ClientShot(api);
     }
 
     void OnEntityIn(Entity e)
@@ -122,6 +125,8 @@ public sealed class DinoStageSystem : ModSystem
         MoverGuard.Remove(harmony);
         harmony = null;
         ClientHold.Stop();
+        shot?.Dispose();
+        shot = null;
         base.Dispose();
     }
 }

@@ -91,6 +91,7 @@ public sealed class SelfTest
     public string Start()
     {
         Ops.TestAlwaysActive = true;
+        Ops.TestRequirePoses = true; // server animator computes RootPoses, read by the 1.1.0 pose checks
         string ts = DateTime.Now.ToString("yyyyMMdd-HHmmss");
         logPath = Path.Combine(api.GetOrCreateDataPath("dinostage"), "selftest-" + ts + ".txt");
         L("DinoStage selftest " + ts + ". Mover guard: " + MoverGuard.Status);
@@ -444,6 +445,9 @@ public sealed class SelfTest
             try { SceneIO.Delete(api, sceneName); Info("scene file deleted again"); } catch { }
         });
 
+        // 8b. 1.1.0 animation API checks on A (clean switch, layer, layer cap, resetpose, freeze default capture)
+        BuildAnimChecks(c);
+
         // 9. final thaw + cleanup
         AddOnce(c, () =>
         {
@@ -458,5 +462,391 @@ public sealed class SelfTest
             }
         });
         AddDelay(c, 10);
+    }
+
+    // ------------------------------------------------------------------ 1.1.0 animation checks
+
+    /// <summary>
+    /// Clean switch, stuck-pose proof, layer stacking, layer cap, mover with layers, client hold, resetpose, freeze default capture and scene files,
+    /// all on actor A (requires Ops.TestRequirePoses so the server animator computes RootPoses). Compares real engine poses, not just state.
+    /// </summary>
+    static string RaDiag(Entity e, string key)
+    {
+        RunningAnimation? ra = e.AnimManager?.Animator?.GetAnimationState(key);
+        return ra == null ? key + " none" : key + " frame=" + ra.CurrentFrame.ToString("0.##") + " ease=" + ra.EasingFactor.ToString("0.###") + " blended=" + ra.BlendedWeight.ToString("0.###") + " active=" + ra.Active + " running=" + ra.Running + " speed=" + (ra.meta?.AnimationSpeed.ToString("0.##") ?? "?");
+    }
+
+    void BuildAnimChecks(Ctx c)
+    {
+        var ks = new List<string>();
+        string k1 = "", k2 = "", k3 = "";
+        Dictionary<string, float[]>? pBase = null, pBl = null, pSw = null, pRef = null;
+        float yaw0 = 0, pitch0 = 0, roll0 = 0;
+        bool ok = false;
+        const float Eps = 1e-4f;
+
+        AddOnce(c, () =>
+        {
+            Entity a = c.A!;
+            Info("=== 1.1.0 animation checks on A (" + a.Code + ") ===");
+            ks = AnimProbe.ShapeKeys(a, 5);
+            if (ks.Count >= 1) k1 = ks[0];
+            foreach (string k in ks) if (k != k1 && AnimProbe.KeyedElements(a, k).Count > 0) { k3 = k; break; }
+            foreach (string k in ks) if (k != k1 && k != k3) { k2 = k; break; }
+            ok = k1.Length > 0 && k2.Length > 0 && k3.Length > 0;
+            Info("shape anims with >=5 frames: " + ks.Count + "; k1(base)=" + k1 + " k2(switch)=" + k2 + " k3(layer)=" + k3);
+            if (!ok) { Info("SKIP 1.1.0 checks: fewer than 3 usable shape animations on A"); return; }
+            Ops.ThawEntity(sys, a);
+        });
+        AddDelay(c, 8);
+
+        // ---- stuck proof: StopAnimation alone leaves a speed 0 RunningAnimation (1.0.0 behavior); AnimSet.Clean removes it
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            var m = new AnimationMetaData { Code = k3, Animation = k3, AnimationSpeed = 0f, Weight = 1f, BlendMode = EnumAnimationBlendMode.Average, EaseInSpeed = 1000f, EaseOutSpeed = 1000f, StartFrameOnce = 0.5f * (Freeze.FrameCount(a, k3) - 1) };
+            m.Init();
+            a.AnimManager.StartAnimation(m);
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            ChkBool("stuck proof: speed 0 animation is running after StartAnimation", AnimProbe.RunningKeys(a).Contains(k3), true);
+            a.AnimManager.StopAnimation(k3);
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            ChkBool("stuck proof: StopAnimation alone removes the dictionary key", AnimProbe.ActiveKeys(a).Contains(k3), false);
+            ChkBool("stuck proof (1.0.0 bug): StopAnimation alone leaves the speed 0 RunningAnimation running", AnimProbe.RunningKeys(a).Contains(k3), true);
+            int n = AnimSet.Clean(a.AnimManager, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+            Info("AnimSet.Clean on the stuck animation: " + n + " change(s)");
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            ChkBool("stuck proof: AnimSet.Clean (StopAnimation then Stop) ends the stuck RunningAnimation", AnimProbe.RunningKeys(c.A!).Contains(k3), false);
+        });
+
+        // ---- clean switch equivalence: base k1 -> SetBase k2 must equal a fresh freeze straight on k2
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = Ops.FreezeEntity(sys, a, k1, 0f, 0.5f * (Freeze.FrameCount(a, k1) - 1));
+            ChkBool("fresh freeze starts without layers", d.Layers.Count == 0, true);
+            yaw0 = d.Yaw; pitch0 = d.Pitch; roll0 = d.Roll;
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            ChkBool("base k1 held alone before the switch", AnimProbe.SameSet(AnimProbe.RunningKeys(a), new[] { k1 }), true);
+            StageData d = StageState.Read(a)!;
+            string msg = AnimOps.SetBase(a, d, k2, null, "0.5");
+            Info("SetBase: " + msg);
+            Ops.Commit(sys, a, d);
+        });
+        AddDelay(c, 8);
+        float swFrame = float.NaN;
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            var run = AnimProbe.RunningKeys(a);
+            ChkBool("clean switch: running keys == [k2] (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { k2 }), true);
+            swFrame = Freeze.CurrentFrame(a, k2) ?? float.NaN;
+            pSw = AnimProbe.Poses(a);
+            Info("switched trot state: " + RaDiag(a, k2));
+            ChkBool("poses available on the server animator (requirePosesOnServer)", pSw != null && pSw.Count > 0, true);
+            Ops.ThawEntity(sys, a);
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            Ops.FreezeEntity(sys, a, k2, 0f, swFrame);
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            pRef = AnimProbe.Poses(a);
+            Info("fresh freeze trot state: " + RaDiag(a, k2) + " ; running=" + AnimProbe.J(AnimProbe.RunningKeys(a)) + " ; active=" + AnimProbe.J(AnimProbe.ActiveKeys(a)));
+            Chk("clean switch frame == fresh freeze frame", Freeze.CurrentFrame(a, k2) ?? float.NaN, swFrame, 0.01);
+            ChkBool("clean switch running keys == fresh freeze running keys", AnimProbe.SameSet(AnimProbe.RunningKeys(a), new[] { k2 }), true);
+            if (pSw != null && pRef != null && AnimProbe.MaxDiff(pSw, pRef) > Eps) Info("clean switch pose worst element: " + AnimProbe.Worst(pSw, pRef) + " ; differing elements: " + AnimProbe.J(AnimProbe.Differing(pSw, pRef, Eps)));
+            if (pSw != null && pRef != null) Chk("clean switch pose == fresh freeze pose (max element delta over " + pSw.Count + " elements)", AnimProbe.MaxDiff(pSw, pRef), 0.0, Eps);
+            else { fail++; L("FAIL clean switch pose compare: no poses"); }
+        });
+
+        // ---- layer stacking: base k1 alone vs base k1 + layer k3, on the layer's keyframed elements only
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = StageState.Read(a)!;
+            AnimOps.SetBase(a, d, k1, 0, "0.5");
+            Ops.Commit(sys, a, d);
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            pBase = AnimProbe.Poses(a);
+            StageData d = StageState.Read(a)!;
+            string msg = AnimOps.AddLayer(a, d, k3, 0, "0.5");
+            Info("AddLayer: " + msg);
+            Ops.Commit(sys, a, d);
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            pBl = AnimProbe.Poses(a);
+            var run = AnimProbe.RunningKeys(a);
+            ChkBool("layer: running keys == [k1,k3] (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { k1, k3 }), true);
+            StageData d = StageState.Read(a)!;
+            ChkBool("layer persisted in the stage tree", d.Layers.Count == 1 && d.Layers[0].Anim == k3, true);
+            if (pBase == null || pBl == null) { fail++; L("FAIL layer pose compare: no poses"); return; }
+            HashSet<string> diff = AnimProbe.Differing(pBl, pBase, Eps);
+            HashSet<string> keyed = AnimProbe.KeyedElements(a, k3);
+            HashSet<string> outside = new(diff, StringComparer.OrdinalIgnoreCase);
+            outside.ExceptWith(keyed);
+            Info("layer diff elements=" + diff.Count + " keyed by layer=" + keyed.Count + " outside keyed=" + AnimProbe.J(outside));
+            ChkBool("layer: pose differs from base alone on at least one element", diff.Count > 0, true);
+            ChkBool("layer: pose differs ONLY on elements keyframed by the layer animation", outside.Count == 0, true);
+        });
+
+        // ---- re-apply updates an existing layer (count stays 1)
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = StageState.Read(a)!;
+            AnimOps.AddLayer(a, d, k3, 0, "0.25");
+            Ops.Commit(sys, a, d);
+            ChkBool("re-applying a layer updates it in place (1 layer)", StageState.Read(a)!.Layers.Count == 1, true);
+        });
+        AddDelay(c, 4);
+
+        // ---- mover with layers: vanilla mover moves the frozen actor, base + layer hold
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = StageState.Read(a)!;
+            AnimOps.AddLayer(a, d, k3, 0, "0.5"); // back to the stacked pose of pBl
+            Ops.Commit(sys, a, d);
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () => { if (ok) MoverStart(c.A!); });
+        for (int i = 1; i <= 10; i++)
+        {
+            int k = i;
+            AddOnce(c, () => { if (ok) MoverStep(c.A!, new Vec3d(c.BaseA.X + 0.1 * k, c.BaseA.Y + 6 + 0.05 * k, c.BaseA.Z)); });
+        }
+        AddOnce(c, () => { if (ok) MoverStop(c.A!); });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            var run = AnimProbe.RunningKeys(a);
+            ChkBool("mover with layer: running keys still [k1,k3] (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { k1, k3 }), true);
+            var p = AnimProbe.Poses(a);
+            if (p != null && pBl != null) Chk("mover with layer: stacked pose unchanged after the move", AnimProbe.MaxDiff(p, pBl), 0.0, Eps);
+            ChkBool("mover with layer: staged and layer kept", StageState.IsStaged(a) && StageState.Read(a)!.Layers.Count == 1, true);
+        });
+
+        // ---- client hold against a stray default-style animation, synchronously (no server assert can run in between)
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            var m = new AnimationMetaData { Code = k2, Animation = k2, AnimationSpeed = 1f, Weight = 1f, BlendMode = EnumAnimationBlendMode.Average };
+            m.Init();
+            a.AnimManager.StartAnimation(m);
+            ChkBool("client hold: stray animation is active before HoldEntity", AnimProbe.ActiveKeys(a).Contains(k2), true);
+            ClientHold.HoldEntity(a);
+            var act = AnimProbe.ActiveKeys(a);
+            ChkBool("client hold: HoldEntity leaves exactly [k1,k3] active (found " + AnimProbe.J(act) + ")", AnimProbe.SameSet(act, new[] { k1, k3 }), true);
+        });
+        AddDelay(c, 4);
+
+        // ---- layer cap
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            List<string> all = AnimProbe.ShapeKeys(a, 1).Where(k => k != k1).ToList();
+            if (all.Count < 5) { Info("SKIP layer cap: only " + all.Count + " other shape animations"); return; }
+            StageData d = StageState.Read(a)!;
+            AnimOps.SetBase(a, d, k1, 0, "0.5");
+            int added = 0;
+            foreach (string k in all.Take(4)) { AnimOps.AddLayer(a, d, k, 0, "0.5"); added++; }
+            Chk("layer cap: four layers accepted", d.Layers.Count, 4, 0);
+            string err = "";
+            try { AnimOps.AddLayer(a, d, all[4], 0, "0.5"); } catch (StageFail ex) { err = ex.Message; }
+            ChkBool("layer cap: fifth layer is refused with an error message", err.Length > 0, true);
+            ChkBool("layer cap: message says the 5th layer was not added", err.Contains("5th layer"), true);
+            Info("cap message: " + err);
+            Chk("layer cap: layer count still 4", d.Layers.Count, 4, 0);
+            Ops.Commit(sys, a, d);
+            Chk("layer cap: four layers persisted", StageState.Read(a)!.Layers.Count, 4, 0);
+            c.Wait = 0;
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = StageState.Read(a)!;
+            if (d.Layers.Count < 4) return;
+            var run = AnimProbe.RunningKeys(a);
+            Chk("layer cap: base + 4 layers running", run.Count, 5, 0);
+        });
+
+        // ---- resetpose: bind pose, nothing held, angles untouched
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = StageState.Read(a)!;
+            yaw0 = d.Yaw; pitch0 = d.Pitch; roll0 = d.Roll; // angles as staged right before the reset (AI moves the thawed pig between the earlier refreezes)
+            string msg = AnimOps.ResetPose(d);
+            Info("ResetPose: " + msg);
+            Ops.Commit(sys, a, d);
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            StageData d = StageState.Read(a)!;
+            ChkBool("resetpose: staged with no base and no layers", d.Staged && d.Anim.Length == 0 && d.Layers.Count == 0, true);
+            var run = AnimProbe.RunningKeys(a);
+            ChkBool("resetpose: nothing running (found " + AnimProbe.J(run) + ")", run.Count == 0, true);
+            var p = AnimProbe.Poses(a);
+            if (p != null) { var ni = AnimProbe.NonIdentity(p, Eps); ChkBool("resetpose: every element pose is the bind pose (non-identity: " + AnimProbe.J(ni) + ")", ni.Count == 0, true); }
+            Chk("resetpose: yaw untouched", d.Yaw, yaw0, 1e-6);
+            Chk("resetpose: pitch untouched", d.Pitch, pitch0, 1e-6);
+            Chk("resetpose: roll untouched", d.Roll, roll0, 1e-6);
+        });
+
+        // ---- freeze without an explicit anim holds the default animation at frame 0 (or the old capture when there is no default)
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            Ops.ThawEntity(sys, a);
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            string? dk = Freeze.DefaultAnimKey(a);
+            StageData d = Ops.FreezeEntity(sys, a);
+            Info("freeze no anim: default anim key=" + (dk ?? "none") + " -> anim='" + d.Anim + "' source='" + d.Source + "' speed=" + Ops.F(d.Speed) + " frame=" + Ops.F(d.Frame));
+            if (dk != null)
+            {
+                ChkBool("freeze default: anim == default animation", string.Equals(d.Anim, dk, StringComparison.OrdinalIgnoreCase), true);
+                ChkBool("freeze default: source tag is 'default'", d.Source == "default", true);
+                Chk("freeze default: speed 0", d.Speed, 0, 1e-6);
+                Chk("freeze default: frame 0", d.Frame, 0, 1e-6);
+            }
+            else ChkBool("freeze default: no default animation, falls back to captured/empty", d.Source == "captured" || d.Anim.Length == 0, true);
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            string? dk = Freeze.DefaultAnimKey(a);
+            if (dk == null) return;
+            var run = AnimProbe.RunningKeys(a);
+            ChkBool("freeze default: only the default animation runs (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { dk }), true);
+            Chk("freeze default: held at frame 0", Freeze.CurrentFrame(a, dk) ?? float.NaN, 0, 0.01);
+        });
+
+        // ---- scene files: a hand-written 1.0.0 scene (no Layers field) loads; a scene with layers round-trips
+        string s100 = "dinostage_t100_" + DateTime.Now.ToString("HHmmss");
+        string sLay = "dinostage_tlay_" + DateTime.Now.ToString("HHmmss");
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            string json = ("{'Name':'" + s100 + "','HourOfDay':12,'Weather':null,'Actors':[{'Code':'" + a.Code + "','EntityId':" + a.EntityId
+                + ",'X':" + a.Pos.X.ToString(System.Globalization.CultureInfo.InvariantCulture) + ",'Y':" + a.Pos.Y.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                + ",'Z':" + a.Pos.Z.ToString(System.Globalization.CultureInfo.InvariantCulture)
+                + ",'Heading':0.5,'Pitch':0.1,'Roll':0.2,'Anim':'" + k1 + "','Speed':0,'Frame':3,'Staged':true,'NoPhys':true}]}").Replace('\'', '"');
+            File.WriteAllText(SceneIO.PathFor(api, s100), json);
+            Info("1.0.0 style scene written (no Layers, no layer fields): " + SceneIO.PathFor(api, s100));
+            var acts = new List<Entity>(); var rep = new StringBuilder();
+            bool loaded = SceneIO.Load(sys, s100, acts, rep);
+            ChkBool("1.0.0 scene: loads", loaded && acts.Count == 1, true);
+            StageData? d = StageState.Read(a);
+            ChkBool("1.0.0 scene: actor staged with the stored anim", d != null && d.Staged && d.Anim == k1, true);
+            if (d != null) { Chk("1.0.0 scene: frame 3", d.Frame, 3, 1e-6); ChkBool("1.0.0 scene: no layers", d.Layers.Count == 0, true); }
+            try { SceneIO.Delete(api, s100); } catch { }
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            ChkBool("1.0.0 scene: held base only (found " + AnimProbe.J(AnimProbe.RunningKeys(a)) + ")", AnimProbe.SameSet(AnimProbe.RunningKeys(a), new[] { k1 }), true);
+            StageData d = StageState.Read(a)!;
+            AnimOps.SetBase(a, d, k1, 0, "0.5");
+            AnimOps.AddLayer(a, d, k3, 0, "0.25");
+            AnimOps.AddLayer(a, d, k2, 0.5, null);
+            Ops.Commit(sys, a, d);
+            string path = SceneIO.Save(api, sLay, new[] { a }, a.Pos.XYZ);
+            string txt = File.ReadAllText(path);
+            ChkBool("layer scene: file contains the Layers array with 2 entries", txt.Contains("\"Layers\"") && txt.Split("\"Anim\"").Length - 1 == 3, true);
+            // change the actor, then load: layers must come back
+            StageData d2 = StageState.Read(a)!;
+            AnimOps.SetBase(a, d2, k2, 0, "0.1");
+            Ops.Commit(sys, a, d2);
+        });
+        AddDelay(c, 6);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            var acts = new List<Entity>(); var rep = new StringBuilder();
+            bool loaded = SceneIO.Load(sys, sLay, acts, rep);
+            ChkBool("layer scene: loads", loaded && acts.Count == 1, true);
+            StageData d = StageState.Read(a)!;
+            ChkBool("layer scene: base restored", d.Anim == k1, true);
+            Chk("layer scene: base frame restored", d.Frame, 0.5f * (Freeze.FrameCount(a, k1) - 1) , 0.51);
+            ChkBool("layer scene: two layers restored", d.Layers.Count == 2 && d.Layers[0].Anim == k3 && d.Layers[1].Anim == k2, true);
+            if (d.Layers.Count == 2)
+            {
+                Chk("layer scene: layer 0 frame", d.Layers[0].Frame, 0.25f * (Freeze.FrameCount(a, k3) - 1), 0.51);
+                Chk("layer scene: layer 1 speed", d.Layers[1].Speed, 0.5, 1e-6);
+            }
+        });
+        AddDelay(c, 8);
+        AddOnce(c, () =>
+        {
+            if (!ok) return;
+            Entity a = c.A!;
+            var run = AnimProbe.RunningKeys(a);
+            ChkBool("layer scene: running keys == [k1,k3,k2] after load (found " + AnimProbe.J(run) + ")", AnimProbe.SameSet(run, new[] { k1, k3, k2 }), true);
+            try { SceneIO.Delete(api, sLay); } catch { }
+        });
     }
 }

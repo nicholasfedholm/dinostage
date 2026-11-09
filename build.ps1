@@ -8,7 +8,7 @@ $dll = Join-Path $bin 'DinoStage.dll'
 if (-not (Test-Path $dll)) { throw "dll missing: $dll" }
 $out = Join-Path $root 'out'
 New-Item -ItemType Directory -Force -Path $out | Out-Null
-$zip = Join-Path $out 'dinostage_1.0.0.zip'
+$zip = Join-Path $out 'dinostage_1.1.0.zip'
 if (Test-Path $zip) { Remove-Item $zip -Force }
 $stage = Join-Path $out '_stage'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }

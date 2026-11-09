@@ -194,3 +194,34 @@ Template: %USERPROFILE%/vs_scratch/.claude/worktrees/dinostage-build/sparkvs/src
 - Whether EntityProperties is shared per type (affects Properties.Client.Size writes): not traced.
 - PathTraverser stop API (WaypointsTraverser): no public stop found in a name grep.
 - Player pitch override behavior (positionVersionNumber): INFERRED only.
+
+
+## DinoStage 1.1.0 reset mechanism
+
+Added 2026-11-08 (1.1.0 implementation). DP = %USERPROFILE%/vs_scratch/dec_proj; API files under DP/VintagestoryAPI/Vintagestory/API/Common/. Line numbers 1-based. VERIFIED = re-read in source this session. Full reasoning with the 1.0.0 line numbers is in RESEARCH_ANIMRESET.md.
+
+Root cause of stacked poses in 1.0.0 (VERIFIED)
+- AnimationManager.StopAnimation :232-257 only removes the key from ActiveAnimationsByAnimCode (:242). It never stops the RunningAnimation.
+- AnimatorBase.OnFrame :146-163 marks a RunningAnimation whose key is missing Active=false and applies OnActivityStopped (default Rewind, Animation.cs :47), so it stays Running.
+- ProgressRunningAnimation :185-214 only stops it when Iterations < 0 and EasingFactor < 0.002 (:194-197). With speed 0, RunningAnimation.Progress returns early (RunningAnimation.cs :97-100), EasingFactor never decays, so the stop test is never reached.
+- The stuck animation stays in CurAnims (:207); ClientAnimator.calculateMatrices :263-390 rebuilds every pose from CurAnims each frame and ElementPose.Add sums all of them, so the old pose is added to the new one for ever.
+- Proven by test (selftest "stuck proof"): StopAnimation alone removes the dictionary key and the RunningAnimation is still running; AnimSet.Clean ends it.
+
+The fix: two steps in this order (AnimSet.Clean, used by server Freeze.AssertAnim and client ClientHold.HoldEntity)
+1. am.StopAnimation(key) for every dictionary key not in {base} U {layers}. Order matters: AnimatorBase.OnFrame :118-128 re-activates any RunningAnimation whose key is still in the dictionary, so a Stop() issued while the key is present is undone on the next frame.
+2. RunningAnimation.Stop() (RunningAnimation.cs :159-168) on every Active or Running RunningAnimation (am.Animator.Animations, IAnimator.cs :23) not in the keep set. It sets Active/Running false, CurrentFrame 0, Iterations 0, EasingFactor 0 immediately, no easing. It is the only immediate hard stop; no animator-wide reset exists (IAnimator.cs :6-49, AnimatorBase.cs).
+
+Client default idle (VERIFIED, the part the 1.0.0 research left open)
+- EntityAgent.cs :583-652 restarts the client default animation (config entry with triggeredBy.defaultAnim, :608) on every client tick. A non-default Average-blend active animation makes the same block STOP the default idle (:633-638, unless alwaysRunIdle). SupressDefaultAnimation is read from the config entries.
+- AnimationPacket.cs :46-47 skips DefaultAnim-triggered entries, so the server never sends it and cannot stop it. AnimationManager.OnReceivedServerAnimations :277-332 keeps client entries with TriggeredBy and WasStartedFromTrigger (:327) and mutates shared config metas (speed from the packet, :289 and :314).
+- 1.1.0 therefore holds on the client from a Harmony postfix on EntityAgent.OnGameTick (id dinostage.client) plus the 50 ms listener: HoldEntity cleans to {base} U {layers}, starts the default anim itself when it is the base and not running, zeroes the speed of the held metas (remembering the idle speed), and Release restores the idle speed and hard-stops orphans on unstage.
+- Client-side StopAnimation does not set AnimationsDirty (server only, AnimationManager.cs :238), so the client clean is local and idempotent.
+
+Freeze default capture
+- Default animation = Properties.Client.Animations entry with TriggeredBy.DefaultAnim == true (EntityAgent.cs :608; AnimationTrigger.cs :33); key = its Animation field lower-cased. Freeze.CaptureAnim holds it at frame 0, speed 0, Source "default"; with no default entry the old highest-Weight capture is kept (Source "captured"). Reason: the highest-Weight capture picked "alert" (weight 10, AnimationMetaData.cs :86) from an AI task.
+
+Layers
+- Layers are ordinary additional entries in ActiveAnimationsByAnimCode held at their stored frame (same Freeze.AssertOne path as the base). Blend is whatever the animation's own config meta says; poses of elements keyed by both animations combine in ClientAnimator.calculateMatrices per element weights. Cap 4 is a DinoStage rule, not an engine limit.
+
+Test method note
+- ServerAnimator derives from ClientAnimator but only computes matrices/poses when `!Alive || entity.requirePosesOnServer`. The tests set requirePosesOnServer before SpawnEntity (Ops.TestRequirePoses) and compare real ElementPose values (degX/Y/Z, scale, translate) from AnimatorBase.RootPoses.

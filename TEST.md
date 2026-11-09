@@ -36,6 +36,13 @@ Setup: creative world with LoP packs (a tyrannosaur, a herbivore, a Triceratops 
 2. Success: actors fall to the ground if airborne, then walk and animate again within a few seconds (AI resumes). Pitch and roll return to level.
 3. Do this for a land animal. Plesiosaur needs water (section G).
 
+## E2. 1.1.0 animation reset and layers (about 3 min, in game)
+Actor: `abelisauridaepatched:...-pycnonemosaurus-adult-male` (use `/entity spawn` autocomplete for the exact code).
+(a) `/stage spawn <pycnonemosaurus adult male>`, `/stage freeze` immediately. Check: the arms are DOWN (default idle at frame 0), not raised in the Alert pose. `/stage actors` shows the animation tagged (default).
+(b) `/stage anim sleep`, then `/stage anim hurt` (clean switch). Check: the pose equals `/stage anim hurt` done on a fresh frozen copy; no trace of the sleep pose remains.
+(c) `/stage anim sleep`, then `/stage animlayer hurt`. Check: the stacked thrash pose appears (sleep body with hurt movement on top). `/stage anim sleep` clears the layer. `/stage animlayer` a 5th distinct animation: refused with a message. `/stage resetpose`: bind pose (T-pose style), heading/pitch/roll unchanged, no idle comes back.
+(d) With a base plus layer posed, `/stage scene save lay1`, `/stage thaw`, `/stage scene load lay1`. Check: the same stacked pose returns. Also load a scene saved by 1.0.0: it must load with no layers.
+
 ## F. Quick fail checks
 - `/stage scale` replies "not shipped" with the reason (expected).
 - `/stage spawn nonsense` reports an unknown code (expected).
@@ -46,3 +53,4 @@ Setup: creative world with LoP packs (a tyrannosaur, a herbivore, a Triceratops 
 3. Camera angles: after `/stage camera loom`, check the view faces actor 1. Inferred only; if not, aim by hand and note it.
 4. Plesiosaur AI resume in water: spawn a plesiosaur in water, freeze, `/stage clear`, check it swims again. The headless run was inconclusive (a never-frozen control plesiosaur out of water also had no tasks).
 5. Chunk reload: freeze a dino, walk 200+ blocks away and back. It should still hold its stored pose.
+6. 1.1.0 client hold: for E2 (a) and (c) look from the client side (not only the server console). The client default idle must not creep back under a staged actor; the Harmony patch status is logged as `client hold: applied (EntityAgent.OnGameTick postfix)` at client start. Not verifiable headless.

@@ -15,6 +15,9 @@ public static class Ops
     /// <summary>Test only: spawned entities get AlwaysActive (headless server has no player, so entities would stay Inactive and never tick: no gravity, no AI, no animator).</summary>
     public static bool TestAlwaysActive;
 
+    /// <summary>Test only: spawned entities get requirePosesOnServer so the server animator computes element poses (RootPoses), letting tests compare real engine pose data.</summary>
+    public static bool TestRequirePoses;
+
     public static readonly List<Entity> TestPumped = new();
     static readonly HashSet<Entity> pumpSeen = new();
     static long pumpId;
@@ -50,6 +53,7 @@ public static class Ops
         if (props == null) { error = "Unknown entity type '" + code + "'."; return null; }
         Entity e = api.ClassRegistry.CreateEntity(props);
         if (TestAlwaysActive) e.AlwaysActive = true;
+        if (TestRequirePoses) e.requirePosesOnServer = true;
         e.Pos.SetPos(x, y, z);
         e.Pos.Yaw = yaw;
         e.Pos.Pitch = 0f;
@@ -82,7 +86,7 @@ public static class Ops
             d.Staged = true;
             d.Yaw = e.Pos.Yaw; d.Pitch = e.Pos.Pitch; d.Roll = e.Pos.Roll;
         }
-        if (animKey != null) d.Anim = animKey;
+        if (animKey != null) { d.Anim = animKey; d.Source = ""; }
         if (speed.HasValue) d.Speed = speed.Value;
         if (frame.HasValue) d.Frame = frame.Value;
         Commit(sys, e, d);
@@ -119,6 +123,13 @@ public static class Ops
         return true;
     }
 
+    public static bool ValidShotName(string? n)
+    {
+        if (string.IsNullOrEmpty(n) || n.Length > 64) return false;
+        foreach (char c in n) if (!(char.IsAsciiLetterOrDigit(c) || c == '-' || c == '_')) return false;
+        return true;
+    }
+
     public static bool TryNum(string? s, out double v)
     {
         v = 0;
@@ -132,8 +143,14 @@ public static class Ops
         StageData? d = StageState.Read(e);
         string s = e.Code.ToString() + " id=" + e.EntityId + " at " + F(e.Pos.X) + "," + F(e.Pos.Y) + "," + F(e.Pos.Z);
         if (d != null && d.Staged)
-            s += " STAGED anim=" + (d.Anim.Length == 0 ? "-" : d.Anim) + " speed=" + F(d.Speed) + " frame=" + F(d.Frame)
-              + " heading=" + F(d.Yaw / Deg) + " pitch=" + F(d.Pitch / Deg) + " roll=" + F(d.Roll / Deg);
+        {
+            // "(default)" = the entity default animation was chosen at freeze time, "(captured)" = highest weight active animation
+            string src = d.Source.Length > 0 && d.Anim.Length > 0 ? " (" + d.Source + ")" : "";
+            s += " STAGED anim=" + (d.Anim.Length == 0 ? "-" : d.Anim) + " speed=" + F(d.Speed) + " frame=" + F(d.Frame) + src;
+            if (d.Layers.Count > 0)
+                s += " layers=[" + string.Join(", ", d.Layers.ConvertAll(l => l.Anim + " speed=" + F(l.Speed) + " frame=" + F(l.Frame))) + "]";
+            s += " heading=" + F(d.Yaw / Deg) + " pitch=" + F(d.Pitch / Deg) + " roll=" + F(d.Roll / Deg);
+        }
         return s;
     }
 }

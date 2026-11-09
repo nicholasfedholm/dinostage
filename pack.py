@@ -4,7 +4,7 @@ dll = os.path.join(root, "src", "DinoStage", "bin", "Release", "DinoStage.dll")
 info = os.path.join(root, "src", "DinoStage", "modinfo.json")
 out = os.path.join(root, "out")
 os.makedirs(out, exist_ok=True)
-zp = os.path.join(out, "dinostage_1.0.0.zip")
+zp = os.path.join(out, "dinostage_1.1.0.zip")
 if os.path.exists(zp):
     os.remove(zp)
 with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
@@ -12,4 +12,5 @@ with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
     z.write(dll, "DinoStage.dll")
 with zipfile.ZipFile(zp) as z:
     print("testzip:", z.testzip(), "files:", [(i.filename, i.file_size) for i in z.infolist()])
-print("zip", zp, os.path.getsize(zp), hashlib.sha256(open(zp, "rb").read()).hexdigest())
+data = open(zp, "rb").read()
+print("zip", zp, "size", os.path.getsize(zp), "md5", hashlib.md5(data).hexdigest(), "sha256", hashlib.sha256(data).hexdigest())

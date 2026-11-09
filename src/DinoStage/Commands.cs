@@ -44,9 +44,11 @@ public sealed class Commands
         Sub(root, "list-anims", "list-anims [actor#]", ListAnims);
         Sub(root, "freeze", "freeze [all] [phys]: hold current actor (AI off, physics off, animation paused)", FreezeCmd);
         Sub(root, "thaw", "thaw [all]: restore AI, physics, animation", ThawCmd);
-        Sub(root, "anim", "anim <code> [speed] [progress]", AnimCmd);
-        Sub(root, "speed", "speed <v>: 0 holds the frame", SpeedCmd);
-        Sub(root, "progress", "progress <frame | 0.0..1.0 with a dot | n%>", ProgressCmd);
+        Sub(root, "anim", "anim <code> [speed] [progress]: clean switch, exactly this animation (every other animation stopped, layers cleared; heading/pitch/roll untouched)", AnimCmd);
+        Sub(root, "animlayer", "animlayer <code> [speed] [progress]: stack an animation on top of the held pose without resetting (max 4 layers; cleared by anim and resetpose)", AnimLayerCmd);
+        Sub(root, "resetpose", "resetpose: clear the base animation and all layers back to the bind pose (heading/pitch/roll untouched)", ResetPoseCmd);
+        Sub(root, "speed", "speed <v>: 0 holds the frame (base animation)", SpeedCmd);
+        Sub(root, "progress", "progress <frame | 0.0..1.0 with a dot | n%> (base animation)", ProgressCmd);
         Sub(root, "place", "place <dx> <dy> <dz>: offset from the player's feet", PlaceCmd);
         Sub(root, "placeabs", "placeabs <x> <y> <z>", PlaceAbsCmd);
         Sub(root, "heading", "heading <deg>", HeadingCmd);
@@ -63,6 +65,7 @@ public sealed class Commands
         Sub(root, "light", "light noon: 12h and clearsky", LightCmd);
         Sub(root, "camera", "camera loom [back] [up]", CameraCmd);
         Sub(root, "hints", "hints on|off", HintsCmd);
+        Sub(root, "shot", "shot <name>: hide the HUD and save the frame to shots/<name>.png (poses untouched)", ShotCmd);
         Sub(root, "selftest", "run the scripted self test (console friendly)", SelfTestCmd);
         Sub(root, "selftest2", "run the extended self test (chunk reload, two actors, unstage, scene)", SelfTest2Cmd);
     }
@@ -174,17 +177,15 @@ public sealed class Commands
         }
         string msg;
         try { msg = f(e, d); }
-        catch (CmdFail ex) { return Err(ex.Message); }
+        catch (StageFail ex) { return Err(ex.Message); }
         Ops.Commit(sys, e, d);
         return Ok((was ? "" : "(froze actor first) ") + msg);
     }
 
-    sealed class CmdFail : Exception { public CmdFail(string m) : base(m) { } }
-
     // ---------------------------------------------------------------- commands
 
     TextCommandResult Help(TextCommandCallingArgs a) =>
-        Ok("DinoStage commands: select actors clear spawn list-anims freeze thaw anim speed progress place placeabs heading pitch roll nudge nudgepitch nudgeroll actor scale scene time weather light camera hints selftest. Use /stage <command> with the usage shown in /help stage.");
+        Ok("DinoStage commands: select actors clear spawn list-anims freeze thaw anim animlayer resetpose speed progress place placeabs heading pitch roll nudge nudgepitch nudgeroll actor scale scene time weather light camera hints selftest. Use /stage <command> with the usage shown in /help stage.");
 
     TextCommandResult Select(TextCommandCallingArgs a)
     {
@@ -292,7 +293,7 @@ public sealed class Commands
             n++;
             sb.AppendLine("Frozen: " + Ops.Describe(t));
         }
-        string note = targets.Any(t => (StageState.Read(t)?.Anim ?? "").Length == 0) ? "\nNo active animation was captured: AI and physics are frozen only. Use /stage anim <code> to choose a pose." : "";
+        string note = targets.Any(t => (StageState.Read(t)?.Anim ?? "").Length == 0) ? "\nNo default or active animation was found: bind pose held, AI and physics frozen. Use /stage anim <code> to choose a pose." : "";
         return Ok(sb.ToString().TrimEnd() + note, "Pose it: /stage anim <code> 0 0.5 then /stage pitch 20");
     }
 
@@ -312,27 +313,18 @@ public sealed class Commands
     TextCommandResult AnimCmd(TextCommandCallingArgs a)
     {
         string? code = A(a, 0);
-        if (code == null) return Err("Usage: /stage anim <code> [speed] [progress]. See /stage list-anims.");
-        return Mod(a, (e, d) =>
-        {
-            string? key = Freeze.ResolveAnimKey(e, code);
-            if (key == null) throw new CmdFail("Unknown animation '" + code + "' for " + e.Code + ". Use /stage list-anims.");
-            int frames = Freeze.FrameCount(e, key);
-            bool hasSpeed = Ops.TryNum(A(a, 1), out double sp);
-            bool hasProg = false; float fr = 0; string how = "";
-            string? ps = A(a, 2);
-            if (ps != null)
-            {
-                if (!Ops.ParseProgress(ps, frames, out fr, out how)) throw new CmdFail("Bad progress '" + ps + "'.");
-                hasProg = true;
-            }
-            bool changed = !string.Equals(d.Anim, key, StringComparison.OrdinalIgnoreCase);
-            d.Anim = key;
-            d.Speed = hasSpeed ? (float)sp : (hasProg ? 0f : 1f);
-            if (hasProg) d.Frame = fr; else if (changed) d.Frame = 0f;
-            return "anim " + key + " speed " + Ops.F(d.Speed) + " frame " + Ops.F(d.Frame) + " of " + frames + (hasProg ? " (" + how + ")" : "");
-        });
+        if (code == null) return Err("Usage: /stage anim <code> [speed] [progress]. Clean switch (everything else stopped, layers cleared). See /stage list-anims.");
+        return Mod(a, (e, d) => AnimOps.SetBase(e, d, code, Ops.TryNum(A(a, 1), out double sp) ? sp : null, A(a, 2)));
     }
+
+    TextCommandResult AnimLayerCmd(TextCommandCallingArgs a)
+    {
+        string? code = A(a, 0);
+        if (code == null) return Err("Usage: /stage animlayer <code> [speed] [progress]. Stacks on top of the held pose (max " + AnimSet.MaxLayers + " layers). See /stage list-anims.");
+        return Mod(a, (e, d) => AnimOps.AddLayer(e, d, code, Ops.TryNum(A(a, 1), out double sp) ? sp : null, A(a, 2)));
+    }
+
+    TextCommandResult ResetPoseCmd(TextCommandCallingArgs a) => Mod(a, (e, d) => AnimOps.ResetPose(d));
 
     TextCommandResult SpeedCmd(TextCommandCallingArgs a)
     {
@@ -351,9 +343,9 @@ public sealed class Commands
         if (s == null) return Err("Usage: /stage progress <frame number | fraction with a dot e.g. 0.5 | 50%>");
         return Mod(a, (e, d) =>
         {
-            if (d.Anim.Length == 0) throw new CmdFail("Actor has no animation. Use /stage anim <code> first.");
+            if (d.Anim.Length == 0) throw new StageFail("Actor has no base animation. Use /stage anim <code> first.");
             int frames = Freeze.FrameCount(e, d.Anim);
-            if (!Ops.ParseProgress(s, frames, out float fr, out string how)) throw new CmdFail("Bad progress '" + s + "'.");
+            if (!Ops.ParseProgress(s, frames, out float fr, out string how)) throw new StageFail("Bad progress '" + s + "'.");
             d.Frame = fr; d.Speed = 0f;
             return "holding frame " + Ops.F(fr) + " of " + frames + " (" + how + ")";
         });
@@ -393,6 +385,15 @@ public sealed class Commands
     {
         if (!Ops.TryNum(A(a, 0), out double v)) return Err("Usage: /stage pitch <deg>");
         return Mod(a, (e, d) => { d.Pitch = (float)v * Deg; return "pitch " + Ops.F(v); });
+    }
+
+    TextCommandResult ShotCmd(TextCommandCallingArgs a)
+    {
+        string? name = A(a, 0);
+        if (name == null || !Ops.ValidShotName(name)) return Err("Usage: /stage shot <name>  (letters, digits, - and _, up to 64 characters)");
+        if (a.Caller.Player is not IServerPlayer sp) return Err("shot needs a player caller (the frame is saved by that player's client)");
+        api.Network.GetChannel(ClientShot.Channel).SendPacket(new ShotMsg { Name = name }, sp);
+        return TextCommandResult.Success("Shot requested: " + name + ".png (HUD hides for a few frames; the client chat confirms the saved path).");
     }
 
     TextCommandResult RollCmd(TextCommandCallingArgs a)
